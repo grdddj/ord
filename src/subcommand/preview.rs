@@ -85,6 +85,7 @@ impl Preview {
             no_backup: true,
             satpoint: None,
             dry_run: false,
+            vanity: None,
             no_limit: false,
             destination: None,
           },

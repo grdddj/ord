@@ -51,7 +51,14 @@ pub(crate) struct Inscribe {
   pub(crate) dry_run: bool,
   #[clap(long, help = "Send inscription to <DESTINATION>.")]
   pub(crate) destination: Option<Address<NetworkUnchecked>>,
+  #[clap(long, help = "Vanity inscription ID.")]
+  pub(crate) vanity: Option<String>,
 }
+
+fn is_valid_hex(s: &str) -> bool {
+    s.chars().all(|c| c.is_digit(16))
+}
+
 
 impl Inscribe {
   pub(crate) fn run(self, options: Options) -> Result {
@@ -76,19 +83,38 @@ impl Inscribe {
       None => get_change_address(&client, &options)?,
     };
 
-    let (unsigned_commit_tx, reveal_tx, recovery_key_pair) =
-      Inscribe::create_inscription_transactions(
-        self.satpoint,
-        inscription,
-        inscriptions,
-        options.chain().network(),
-        utxos.clone(),
-        commit_tx_change,
-        reveal_tx_destination,
-        self.commit_fee_rate.unwrap_or(self.fee_rate),
-        self.fee_rate,
-        self.no_limit,
-      )?;
+    let (do_vanity, vanity) = match self.vanity {
+      Some(vanity) if is_valid_hex(&vanity) => (true, vanity),
+      _ => (false, "".to_string()),
+    };
+
+    if do_vanity {
+      println!("Vanity: {}", vanity);
+    }
+
+    let mut counter = 0;
+    let (unsigned_commit_tx, reveal_tx, recovery_key_pair) = loop {
+      let (unsigned_commit_tx, reveal_tx, recovery_key_pair) =
+        Inscribe::create_inscription_transactions(
+          self.satpoint,
+          inscription.clone(),
+          inscriptions.clone(),
+          options.chain().network(),
+          utxos.clone(),
+          commit_tx_change.clone(),
+          reveal_tx_destination.clone(),
+          self.commit_fee_rate.unwrap_or(self.fee_rate),
+          self.fee_rate,
+          self.no_limit,
+        )?;
+
+      let str_revealtxid = reveal_tx.txid().to_string();
+      if !do_vanity || str_revealtxid.starts_with(&vanity) {
+        println!("Iterations needed: {}", counter);
+        break (unsigned_commit_tx, reveal_tx, recovery_key_pair);
+      }
+      counter += 1;
+    };
 
     utxos.insert(
       reveal_tx.input[0].previous_output,
