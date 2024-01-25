@@ -122,6 +122,7 @@ impl Preview {
               reinscribe: false,
               satpoint: None,
               sat: None,
+              vanity: None,
             }),
           }),
         }
@@ -155,6 +156,7 @@ impl Preview {
               reinscribe: false,
               satpoint: None,
               sat: None,
+              vanity: None,
             }),
           }),
         }
