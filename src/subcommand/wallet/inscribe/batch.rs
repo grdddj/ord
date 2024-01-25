@@ -13,6 +13,7 @@ pub(super) struct Batch {
   pub(super) reinscribe: bool,
   pub(super) reveal_fee_rate: FeeRate,
   pub(super) satpoint: Option<SatPoint>,
+  pub(crate) vanity: Option<String>,
 }
 
 impl Default for Batch {
@@ -30,8 +31,13 @@ impl Default for Batch {
       reinscribe: false,
       reveal_fee_rate: 1.0.try_into().unwrap(),
       satpoint: None,
+      vanity: None,
     }
   }
+}
+
+fn is_valid_hex(s: &str) -> bool {
+  s.chars().all(|c| c.is_digit(16))
 }
 
 impl Batch {
@@ -51,15 +57,34 @@ impl Batch {
       get_change_address(client, chain)?,
     ];
 
-    let (commit_tx, reveal_tx, recovery_key_pair, total_fees) = self
-      .create_batch_inscription_transactions(
-        wallet_inscriptions,
-        chain,
-        locked_utxos.clone(),
-        runic_utxos,
-        utxos.clone(),
-        commit_tx_change,
-      )?;
+    let (do_vanity, vanity) = match self.vanity.clone() {
+      Some(vanity) if is_valid_hex(&vanity) => (true, vanity),
+      _ => (false, "".to_string()),
+    };
+
+    if do_vanity {
+      println!("Vanity: {}", vanity);
+    }
+
+    let mut counter = 0;
+    let (commit_tx, reveal_tx, recovery_key_pair, total_fees) = loop {
+      let (commit_tx, reveal_tx, recovery_key_pair, total_fees) = self
+        .create_batch_inscription_transactions(
+          wallet_inscriptions.clone(),
+          chain,
+          locked_utxos.clone(),
+          runic_utxos.clone(),
+          utxos.clone(),
+          commit_tx_change.clone(),
+        )?;
+
+      let str_revealtxid = reveal_tx.txid().to_string();
+      if !do_vanity || str_revealtxid.starts_with(&vanity) {
+        println!("Iterations needed: {}", counter);
+        break (commit_tx, reveal_tx, recovery_key_pair, total_fees);
+      }
+      counter += 1;
+    };
 
     if self.dry_run {
       return Ok(Box::new(self.output(
