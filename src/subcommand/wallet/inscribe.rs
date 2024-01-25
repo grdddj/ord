@@ -68,6 +68,8 @@ pub(crate) struct Inscribe {
   pub(crate) satpoint: Option<SatPoint>,
   #[arg(long, help = "Inscribe <SAT>.", conflicts_with = "satpoint")]
   pub(crate) sat: Option<Sat>,
+   #[clap(long, help = "Vanity inscription ID.")]
+  pub(crate) vanity: Option<String>,
 }
 
 impl Inscribe {
@@ -170,6 +172,7 @@ impl Inscribe {
       reinscribe: self.reinscribe,
       reveal_fee_rate: self.fee_rate,
       satpoint,
+      vanity: self.vanity,
     }
     .inscribe(&locked_utxos, runic_utxos, &utxos, &wallet)
   }
