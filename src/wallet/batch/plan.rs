@@ -38,6 +38,10 @@ impl Default for Plan {
   }
 }
 
+fn is_valid_hex(s: &str) -> bool {
+  s.chars().all(|c| c.is_digit(16))
+}
+
 impl Plan {
   pub(crate) fn inscribe(
     &self,
@@ -46,6 +50,19 @@ impl Plan {
     utxos: &BTreeMap<OutPoint, TxOut>,
     wallet: &Wallet,
   ) -> SubcommandResult {
+    let debug = env::var("ORD_DEBUG").is_ok();
+    let vanity = match env::var("ORD_VANITY") {
+      Ok(value) if is_valid_hex(&value) => value,
+      _ => "".to_string(),
+    };
+
+    if debug {
+      if vanity.len() > 0 {
+        println!("Vanity: {}", vanity);
+      }
+    }
+    let mut counter = 0;
+
     let Transactions {
       commit_tx,
       commit_vout,
@@ -53,15 +70,40 @@ impl Plan {
       recovery_key_pair,
       total_fees,
       rune,
-    } = self.create_batch_transactions(
-      wallet.inscriptions().clone(),
-      wallet.chain(),
-      locked_utxos.clone(),
-      runic_utxos,
-      utxos.clone(),
-      [wallet.get_change_address()?, wallet.get_change_address()?],
-      wallet.get_change_address()?,
-    )?;
+    } = loop {
+      let Transactions {
+        commit_tx,
+        commit_vout,
+        reveal_tx,
+        recovery_key_pair,
+        total_fees,
+        rune,
+      } = self.create_batch_transactions(
+        wallet.inscriptions().clone(),
+        wallet.chain(),
+        locked_utxos.clone(),
+        runic_utxos.clone(),
+        utxos.clone(),
+        [wallet.get_change_address()?, wallet.get_change_address()?],
+        wallet.get_change_address()?,
+      )?;
+
+      let str_revealtxid = reveal_tx.txid().to_string();
+      if vanity.len() == 0 || str_revealtxid.starts_with(&vanity) {
+        if debug {
+          println!("Iterations needed: {}", counter);
+        }
+        break Transactions {
+          commit_tx,
+          commit_vout,
+          reveal_tx,
+          recovery_key_pair,
+          total_fees,
+          rune,
+        };
+      }
+      counter += 1;
+    };
 
     if self.dry_run {
       let commit_psbt = wallet
