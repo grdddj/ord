@@ -36,6 +36,7 @@ use {
   },
 };
 
+use media::Language;
 use serde_cbor::Value as CborValue;
 use serde_json::Value as JsonValue;
 
@@ -795,8 +796,9 @@ impl Index {
     struct InscriptionResult {
       content_type: String,
       content_length: usize,
-      metadata: Option<String>,
+      metadata: Option<JsonValue>,
       text: Option<String>,
+      json: Option<JsonValue>,
       bytes: Option<Vec<u8>>,
     }
 
@@ -835,6 +837,20 @@ impl Index {
           _ => None,
         };
 
+        let json = match inscription.media() {
+          Media::Code(Language::Json) => {
+            if let Some(text_bytes) = inscription.body() {
+              match serde_json::from_slice::<JsonValue>(text_bytes) {
+                Ok(json) => Some(json),
+                Err(_) => None,
+              }
+            } else {
+              None
+            }
+          }
+          _ => None,
+        };
+
         let bytes = if text.is_none() {
           inscription.body().map(|b| b.to_vec())
         } else {
@@ -844,7 +860,8 @@ impl Index {
         InscriptionResult {
           content_type: inscription.content_type().unwrap_or("default").to_string(),
           content_length: inscription.content_length().unwrap_or(0),
-          metadata: Some(metadata_json.to_string()),
+          metadata: Some(metadata_json),
+          json,
           text,
           bytes,
         }
@@ -854,6 +871,7 @@ impl Index {
           content_length: 0,
           metadata: None,
           text: None,
+          json: None,
           bytes: None,
         }
       };
@@ -864,6 +882,7 @@ impl Index {
           "content_type": result.content_type,
           "content_length": result.content_length,
           "metadata": result.metadata,
+          "json": result.json,
           "text": result.text,
       });
 
