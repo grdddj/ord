@@ -28,12 +28,24 @@ use {
     ReadOnlyTable, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, RepairSession,
     StorageError, Table, TableDefinition, TableHandle, TableStats, WriteTransaction,
   },
+  serde_cbor,
   std::{
     collections::HashMap,
     io::{BufWriter, Write},
     sync::Once,
   },
 };
+
+use serde_cbor::Value as CborValue;
+use serde_json::Value as JsonValue;
+
+use mongodb::{
+  bson::{self, doc, Binary, Bson, Document},
+  options::ClientOptions,
+  sync::Client as MongoClient,
+  sync::Collection,
+};
+use std::error::Error;
 
 pub use self::entry::RuneEntry;
 
@@ -180,6 +192,46 @@ impl<T> BitcoinCoreRpcResultExt<T> for Result<T, bitcoincore_rpc::Error> {
       Err(err) => Err(err.into()),
     }
   }
+}
+
+fn upsert_json_to_mongo(
+  client: &MongoClient,
+  db_name: &str,
+  collection_name: &str,
+  json_data: &JsonValue,
+  unique_key: &str,
+  binary_data: Option<(&str, &[u8])>,
+) -> Result<(), Box<dyn Error>> {
+  let database = client.database(db_name);
+  let collection: Collection<Document> = database.collection(collection_name);
+
+  // Convert JSON data to BSON document
+  let mut bson_doc: Document = bson::to_bson(&json_data)?.as_document().unwrap().clone();
+
+  if let Some((bin_key, bin_value)) = binary_data {
+    bson_doc.insert(
+      bin_key,
+      Bson::Binary(Binary {
+        subtype: mongodb::bson::spec::BinarySubtype::Generic,
+        bytes: bin_value.to_vec(),
+      }),
+    );
+  }
+
+  // Define the filter and update document
+  let filter = doc! { unique_key: bson_doc.get_str(unique_key)? };
+  let update_doc = doc! { "$set": bson_doc };
+
+  // Perform the upsert operation
+  collection.update_one(
+    filter,
+    update_doc,
+    mongodb::options::UpdateOptions::builder()
+      .upsert(true)
+      .build(),
+  )?;
+
+  Ok(())
 }
 
 pub struct Index {
@@ -731,6 +783,110 @@ impl Index {
       }
     }
     writer.flush()?;
+    Ok(())
+  }
+
+  pub fn export_mongo(&self, conn: String, db_name: String, collection_name: String) -> Result {
+    let rtx = self.database.begin_read()?;
+
+    let client_options = ClientOptions::parse(conn)?;
+    let client = MongoClient::with_options(client_options)?;
+
+    struct InscriptionResult {
+      content_type: String,
+      content_length: usize,
+      metadata: Option<String>,
+      text: Option<String>,
+      bytes: Option<Vec<u8>>,
+    }
+
+    for result in rtx
+      .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?
+      .iter()?
+    {
+      let entry = result?;
+      let entry = InscriptionEntry::load(entry.1.value());
+
+      let inscription = self.get_inscription_by_id(entry.id)?;
+
+      let result = if let Some(inscription) = &inscription {
+        let slice = &inscription.clone().metadata.unwrap_or_default();
+
+        let metadata_json = if slice.is_empty() {
+          JsonValue::Null
+        } else {
+          serde_cbor::from_slice::<CborValue>(slice)
+            .map_err(|e| e.to_string())
+            .and_then(|cbor_value| serde_json::to_value(cbor_value).map_err(|e| e.to_string()))
+            .unwrap_or(JsonValue::Null)
+        };
+
+        let text = match inscription.media() {
+          Media::Code(_) | Media::Text | Media::Markdown | Media::Iframe => {
+            if let Some(text_bytes) = inscription.body() {
+              match String::from_utf8(text_bytes.to_vec()) {
+                Ok(text) => Some(text),
+                Err(_) => None,
+              }
+            } else {
+              None
+            }
+          }
+          _ => None,
+        };
+
+        let bytes = if text.is_none() {
+          inscription.body().map(|b| b.to_vec())
+        } else {
+          None
+        };
+
+        InscriptionResult {
+          content_type: inscription.content_type().unwrap_or("default").to_string(),
+          content_length: inscription.content_length().unwrap_or(0),
+          metadata: Some(metadata_json.to_string()),
+          text,
+          bytes,
+        }
+      } else {
+        InscriptionResult {
+          content_type: "unknown".to_string(),
+          content_length: 0,
+          metadata: None,
+          text: None,
+          bytes: None,
+        }
+      };
+
+      let json_data = serde_json::json!({
+          "id": entry.id,
+          "num": entry.inscription_number,
+          "content_type": result.content_type,
+          "content_length": result.content_length,
+          "metadata": result.metadata,
+          "text": result.text,
+      });
+
+      let binary_data = if let Some(bytes) = result.bytes.as_deref() {
+        Some(("bytes", bytes))
+      } else {
+        None
+      };
+
+      upsert_json_to_mongo(
+        &client,
+        &db_name,
+        &collection_name,
+        &json_data,
+        "id",
+        binary_data,
+      )
+      .unwrap_or_else(|e| eprintln!("{}", e));
+
+      if SHUTTING_DOWN.load(atomic::Ordering::Relaxed) {
+        break;
+      }
+    }
     Ok(())
   }
 
@@ -1766,6 +1922,10 @@ impl Index {
       .collect::<Result<Vec<InscriptionId>, StorageError>>()?;
 
     let more = u32::try_from(inscriptions.len()).unwrap_or(u32::MAX) > page_size;
+
+    // print more bool into stdout
+    println!("Get all inscriptions IDs");
+    println!("more: {}", more);
 
     if more {
       inscriptions.pop();
