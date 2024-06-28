@@ -36,7 +36,9 @@ use {
   },
 };
 
+use brotli::Decompressor;
 use media::Language;
+use regex::Regex;
 use serde_cbor::Value as CborValue;
 use serde_json::Value as JsonValue;
 
@@ -233,6 +235,36 @@ fn upsert_json_to_mongo(
   )?;
 
   Ok(())
+}
+
+fn contains_pattern(text: &str, pattern: &str) -> bool {
+  match Regex::new(pattern) {
+    Ok(re) => re.is_match(text),
+    Err(_) => false,
+  }
+}
+
+fn extract_patterns(text: &str, pattern: &str) -> Option<Vec<String>> {
+  let re = Regex::new(pattern).ok()?;
+  let results: Vec<String> = re
+    .captures_iter(text)
+    .map(|cap| cap[0].to_string())
+    .collect();
+  if results.is_empty() {
+    None
+  } else {
+    Some(results)
+  }
+}
+
+fn extract_patterns_count_amounts(text: &str, pattern: &str) -> Option<HashMap<String, usize>> {
+  let patterns = extract_patterns(text, pattern)?;
+  let mut map = HashMap::new();
+  for pattern in patterns {
+    let count = map.entry(pattern.clone()).or_insert(0);
+    *count += 1;
+  }
+  Some(map)
 }
 
 pub struct Index {
@@ -797,9 +829,19 @@ impl Index {
       content_type: String,
       content_length: usize,
       metadata: Option<JsonValue>,
+      encoding: Option<String>,
+      decoded_length: Option<usize>,
+      delegate: Option<String>,
+      metaprotocol: Option<String>,
       text: Option<String>,
       json: Option<JsonValue>,
       bytes: Option<Vec<u8>>,
+      inscription_ids: Option<HashMap<String, usize>>,
+      content_ids: Option<HashMap<String, usize>>,
+      recursive_endpoints: Option<HashMap<String, usize>>,
+      parents: Option<HashMap<String, usize>>,
+      uses_content: bool,
+      is_token: bool,
     }
 
     for result in rtx
@@ -823,10 +865,37 @@ impl Index {
             .unwrap_or(JsonValue::Null)
         };
 
+        let content_type = inscription.content_type().unwrap_or("default");
+
+        let encoding = inscription
+          .content_encoding()
+          .map(|encoding| encoding.to_str().unwrap_or("").to_owned());
+
+        let body = if let Some(body) = inscription.body().map(|b| b.to_vec()) {
+          if encoding.is_some() {
+            let mut decompressor = Decompressor::new(body.as_slice(), body.len());
+            let mut decompressed = Vec::new();
+            match decompressor.read_to_end(&mut decompressed) {
+              Ok(_) => Some(decompressed),
+              Err(err) => {
+                println!("decompress error");
+                println!("{:?}", err);
+                Some(body)
+              }
+            }
+          } else {
+            Some(body)
+          }
+        } else {
+          None
+        };
+
+        let decoded_length = body.clone().map(|b| b.len());
+
         let text = match inscription.media() {
           Media::Code(_) | Media::Text | Media::Markdown | Media::Iframe => {
-            if let Some(text_bytes) = inscription.body() {
-              match String::from_utf8(text_bytes.to_vec()) {
+            if let Some(text_bytes) = body.clone() {
+              match String::from_utf8(text_bytes) {
                 Ok(text) => Some(text),
                 Err(_) => None,
               }
@@ -839,8 +908,8 @@ impl Index {
 
         let json = match inscription.media() {
           Media::Code(Language::Json) => {
-            if let Some(text_bytes) = inscription.body() {
-              match serde_json::from_slice::<JsonValue>(text_bytes) {
+            if let Some(text_bytes) = body.clone() {
+              match serde_json::from_slice::<JsonValue>(&text_bytes) {
                 Ok(json) => Some(json),
                 Err(_) => None,
               }
@@ -851,28 +920,88 @@ impl Index {
           _ => None,
         };
 
-        let bytes = if text.is_none() {
-          inscription.body().map(|b| b.to_vec())
+        let is_token = if let Some(json) = &json {
+          let token_list = ["brc-20"];
+          json.get("p").map(|p| {
+            if let JsonValue::String(p) = p {
+              token_list.contains(&p.as_str())
+            } else {
+              false
+            }
+          }) == Some(true)
         } else {
-          None
+          false
+        };
+        let metaprotocol = inscription.metaprotocol().map(|m| m.to_string());
+
+        let bytes = if text.is_none() { body } else { None };
+
+        let delegate = inscription.delegate().map(|d| d.to_string());
+
+        let inscription_ids = text
+          .as_ref()
+          .and_then(|text| extract_patterns_count_amounts(&text, r"[0-9a-fA-F]{64}i\d+"));
+        let content_ids = text
+          .as_ref()
+          .and_then(|text| extract_patterns_count_amounts(&text, r"/content/[0-9a-fA-F]{64}i\d+"));
+        let recursive_endpoints = text
+          .as_ref()
+          .and_then(|text| extract_patterns_count_amounts(&text, r"/r/\w+"));
+
+        let uses_content = text
+          .as_ref()
+          .map(|text| contains_pattern(text, r"/content/"))
+          .unwrap_or(false);
+
+        let parents = inscription.parents();
+        let parents = match parents.len() {
+          0 => None,
+          _ => {
+            let mut map = HashMap::new();
+            for parent in parents {
+              let count = map.entry(parent.to_string()).or_insert(0);
+              *count += 1;
+            }
+            Some(map)
+          }
         };
 
         InscriptionResult {
-          content_type: inscription.content_type().unwrap_or("default").to_string(),
+          content_type: content_type.to_string(),
           content_length: inscription.content_length().unwrap_or(0),
+          decoded_length,
           metadata: Some(metadata_json),
+          metaprotocol,
+          delegate,
+          encoding,
           json,
           text,
           bytes,
+          inscription_ids,
+          content_ids,
+          recursive_endpoints,
+          parents,
+          uses_content,
+          is_token,
         }
       } else {
         InscriptionResult {
           content_type: "unknown".to_string(),
           content_length: 0,
+          decoded_length: None,
           metadata: None,
+          metaprotocol: None,
+          delegate: None,
+          encoding: None,
           text: None,
           json: None,
           bytes: None,
+          inscription_ids: None,
+          content_ids: None,
+          recursive_endpoints: None,
+          parents: None,
+          uses_content: false,
+          is_token: false,
         }
       };
 
@@ -881,9 +1010,19 @@ impl Index {
           "num": entry.inscription_number,
           "content_type": result.content_type,
           "content_length": result.content_length,
+          "decoded_length": result.decoded_length,
+          "delegate": result.delegate,
+          "encoding": result.encoding,
           "metadata": result.metadata,
+          "metaprotocol": result.metaprotocol,
           "json": result.json,
           "text": result.text,
+          "inscription_ids": result.inscription_ids,
+          "content_ids": result.content_ids,
+          "recursive_endpoints": result.recursive_endpoints,
+          "parents": result.parents,
+          "uses_content": result.uses_content,
+          "is_token": result.is_token,
       });
 
       let binary_data = if let Some(bytes) = result.bytes.as_deref() {
