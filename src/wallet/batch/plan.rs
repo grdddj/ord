@@ -38,6 +38,10 @@ impl Default for Plan {
   }
 }
 
+fn is_valid_hex(s: &str) -> bool {
+  s.chars().all(|c| c.is_digit(16))
+}
+
 impl Plan {
   pub(crate) fn inscribe(
     &self,
@@ -364,313 +368,338 @@ impl Plan {
       bail!("reinscribe flag set but this would not be a reinscription");
     }
 
-    let secp256k1 = Secp256k1::new();
-    let key_pair = UntweakedKeypair::new(&secp256k1, &mut rand::thread_rng());
-    let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
-
-    let reveal_script = Inscription::append_batch_reveal_script(
-      &self.inscriptions,
-      ScriptBuf::builder()
-        .push_slice(public_key.serialize())
-        .push_opcode(opcodes::all::OP_CHECKSIG),
-    );
-
-    let taproot_spend_info = TaprootBuilder::new()
-      .add_leaf(0, reveal_script.clone())
-      .expect("adding leaf should work")
-      .finalize(&secp256k1, public_key)
-      .expect("finalizing taproot builder should work");
-
-    let control_block = taproot_spend_info
-      .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
-      .expect("should compute control block");
-
-    let commit_tx_address = Address::p2tr_tweaked(taproot_spend_info.output_key(), chain.network());
-
-    let total_postage = self.postages.clone().into_iter().sum();
-
-    let mut reveal_inputs = Vec::new();
-    let mut reveal_outputs = Vec::new();
-
-    for ParentInfo {
-      location,
-      id: _,
-      destination,
-      tx_out,
-    } in &self.parent_info
-    {
-      reveal_inputs.push(location.outpoint);
-      reveal_outputs.push(TxOut {
-        script_pubkey: destination.script_pubkey(),
-        value: tx_out.value,
-      });
+    let debug = env::var("ORD_DEBUG").is_ok();
+    let vanity = match env::var("ORD_VANITY") {
+      Ok(value) if is_valid_hex(&value) => value,
+      _ => "".to_string(),
+    };
+    if debug && vanity.len() > 0 {
+      println!("Vanity: {}", vanity);
     }
+    let mut counter = 0;
 
-    if self.mode == Mode::SatPoints {
-      for (satpoint, _txout) in self.reveal_satpoints.iter() {
-        reveal_inputs.push(satpoint.outpoint);
+    loop {
+      counter += 1;
+      let secp256k1 = Secp256k1::new();
+      let key_pair = UntweakedKeypair::new(&secp256k1, &mut rand::thread_rng());
+      let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+
+      let reveal_script = Inscription::append_batch_reveal_script(
+        &self.inscriptions,
+        ScriptBuf::builder()
+          .push_slice(public_key.serialize())
+          .push_opcode(opcodes::all::OP_CHECKSIG),
+      );
+
+      let taproot_spend_info = TaprootBuilder::new()
+        .add_leaf(0, reveal_script.clone())
+        .expect("adding leaf should work")
+        .finalize(&secp256k1, public_key)
+        .expect("finalizing taproot builder should work");
+
+      let control_block = taproot_spend_info
+        .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
+        .expect("should compute control block");
+
+      let commit_tx_address =
+        Address::p2tr_tweaked(taproot_spend_info.output_key(), chain.network());
+
+      let total_postage = self.postages.clone().into_iter().sum();
+
+      let mut reveal_inputs = Vec::new();
+      let mut reveal_outputs = Vec::new();
+
+      for ParentInfo {
+        location,
+        id: _,
+        destination,
+        tx_out,
+      } in &self.parent_info
+      {
+        reveal_inputs.push(location.outpoint);
+        reveal_outputs.push(TxOut {
+          script_pubkey: destination.script_pubkey(),
+          value: tx_out.value,
+        });
       }
-    }
 
-    reveal_inputs.push(OutPoint::null());
+      if self.mode == Mode::SatPoints {
+        for (satpoint, _txout) in self.reveal_satpoints.iter() {
+          reveal_inputs.push(satpoint.outpoint);
+        }
+      }
 
-    for (i, destination) in self.destinations.iter().enumerate() {
-      reveal_outputs.push(TxOut {
-        script_pubkey: destination.script_pubkey(),
-        value: match self.mode {
-          Mode::SeparateOutputs | Mode::SatPoints => self.postages[i],
-          Mode::SharedOutput | Mode::SameSat => total_postage,
-        },
-      });
-    }
+      reveal_inputs.push(OutPoint::null());
 
-    let rune;
-    let premine;
-    let runestone;
+      for (i, destination) in self.destinations.iter().enumerate() {
+        reveal_outputs.push(TxOut {
+          script_pubkey: destination.script_pubkey(),
+          value: match self.mode {
+            Mode::SeparateOutputs | Mode::SatPoints => self.postages[i],
+            Mode::SharedOutput | Mode::SameSat => total_postage,
+          },
+        });
+      }
 
-    if let Some(etching) = self.etching {
-      let vout;
-      let destination;
-      premine = etching.premine.to_integer(etching.divisibility)?;
+      let rune;
+      let premine;
+      let runestone;
 
-      if premine > 0 {
-        let output = u32::try_from(reveal_outputs.len()).unwrap();
-        destination = Some(reveal_change.clone());
+      if let Some(etching) = self.etching {
+        let vout;
+        let destination;
+        premine = etching.premine.to_integer(etching.divisibility)?;
+
+        if premine > 0 {
+          let output = u32::try_from(reveal_outputs.len()).unwrap();
+          destination = Some(reveal_change.clone());
+
+          reveal_outputs.push(TxOut {
+            script_pubkey: reveal_change.clone().into(),
+            value: TARGET_POSTAGE,
+          });
+
+          vout = Some(output);
+        } else {
+          vout = None;
+          destination = None;
+        }
+
+        let inner = Runestone {
+          edicts: Vec::new(),
+          etching: Some(ordinals::Etching {
+            divisibility: (etching.divisibility > 0).then_some(etching.divisibility),
+            premine: (premine > 0).then_some(premine),
+            rune: Some(etching.rune.rune),
+            spacers: (etching.rune.spacers > 0).then_some(etching.rune.spacers),
+            symbol: Some(etching.symbol),
+            terms: etching
+              .terms
+              .map(|terms| -> Result<ordinals::Terms> {
+                Ok(ordinals::Terms {
+                  cap: (terms.cap > 0).then_some(terms.cap),
+                  height: (
+                    terms.height.and_then(|range| (range.start)),
+                    terms.height.and_then(|range| (range.end)),
+                  ),
+                  amount: Some(terms.amount.to_integer(etching.divisibility)?),
+                  offset: (
+                    terms.offset.and_then(|range| (range.start)),
+                    terms.offset.and_then(|range| (range.end)),
+                  ),
+                })
+              })
+              .transpose()?,
+            turbo: etching.turbo,
+          }),
+          mint: None,
+          pointer: (premine > 0).then_some((reveal_outputs.len() - 1).try_into().unwrap()),
+        };
+
+        let script_pubkey = inner.encipher();
+
+        runestone = Some(inner);
+
+        ensure!(
+          self.no_limit || script_pubkey.len() <= MAX_STANDARD_OP_RETURN_SIZE,
+          "runestone greater than maximum OP_RETURN size: {} > {}",
+          script_pubkey.len(),
+          MAX_STANDARD_OP_RETURN_SIZE,
+        );
 
         reveal_outputs.push(TxOut {
-          script_pubkey: reveal_change.into(),
-          value: TARGET_POSTAGE,
+          script_pubkey,
+          value: Amount::from_sat(0),
         });
 
-        vout = Some(output);
+        rune = Some((destination, etching.rune, vout));
       } else {
-        vout = None;
-        destination = None;
+        premine = 0;
+        rune = None;
+        runestone = None;
       }
 
-      let inner = Runestone {
-        edicts: Vec::new(),
-        etching: Some(ordinals::Etching {
-          divisibility: (etching.divisibility > 0).then_some(etching.divisibility),
-          premine: (premine > 0).then_some(premine),
-          rune: Some(etching.rune.rune),
-          spacers: (etching.rune.spacers > 0).then_some(etching.rune.spacers),
-          symbol: Some(etching.symbol),
-          terms: etching
-            .terms
-            .map(|terms| -> Result<ordinals::Terms> {
-              Ok(ordinals::Terms {
-                cap: (terms.cap > 0).then_some(terms.cap),
-                height: (
-                  terms.height.and_then(|range| (range.start)),
-                  terms.height.and_then(|range| (range.end)),
-                ),
-                amount: Some(terms.amount.to_integer(etching.divisibility)?),
-                offset: (
-                  terms.offset.and_then(|range| (range.start)),
-                  terms.offset.and_then(|range| (range.end)),
-                ),
-              })
-            })
-            .transpose()?,
-          turbo: etching.turbo,
-        }),
-        mint: None,
-        pointer: (premine > 0).then_some((reveal_outputs.len() - 1).try_into().unwrap()),
+      let commit_input = self.parent_info.len() + self.reveal_satpoints.len();
+
+      let (_reveal_tx, reveal_fee) = Self::build_reveal_transaction(
+        commit_input,
+        &control_block,
+        self.reveal_fee_rate,
+        reveal_outputs.clone(),
+        reveal_inputs.clone(),
+        &reveal_script,
+        rune.is_some(),
+      );
+
+      let mut target_value = reveal_fee;
+
+      if self.mode != Mode::SatPoints {
+        target_value += total_postage;
+      }
+
+      if premine > 0 {
+        target_value += TARGET_POSTAGE;
+      }
+
+      let unsigned_commit_tx = TransactionBuilder::new(
+        satpoint,
+        wallet_inscriptions.clone(),
+        utxos.clone(),
+        locked_utxos.clone(),
+        runic_utxos.clone(),
+        commit_tx_address.script_pubkey(),
+        commit_change.clone(),
+        self.commit_fee_rate,
+        Target::Value(target_value),
+        chain.network(),
+      )
+      .build_transaction()?;
+
+      let (vout, _commit_output) = unsigned_commit_tx
+        .output
+        .iter()
+        .enumerate()
+        .find(|(_vout, output)| output.script_pubkey == commit_tx_address.script_pubkey())
+        .expect("should find sat commit/inscription output");
+
+      reveal_inputs[commit_input] = OutPoint {
+        txid: unsigned_commit_tx.compute_txid(),
+        vout: vout.try_into().unwrap(),
       };
 
-      let script_pubkey = inner.encipher();
-
-      runestone = Some(inner);
-
-      ensure!(
-        self.no_limit || script_pubkey.len() <= MAX_STANDARD_OP_RETURN_SIZE,
-        "runestone greater than maximum OP_RETURN size: {} > {}",
-        script_pubkey.len(),
-        MAX_STANDARD_OP_RETURN_SIZE,
-      );
-
-      reveal_outputs.push(TxOut {
-        script_pubkey,
-        value: Amount::from_sat(0),
-      });
-
-      rune = Some((destination, etching.rune, vout));
-    } else {
-      premine = 0;
-      rune = None;
-      runestone = None;
-    }
-
-    let commit_input = self.parent_info.len() + self.reveal_satpoints.len();
-
-    let (_reveal_tx, reveal_fee) = Self::build_reveal_transaction(
-      commit_input,
-      &control_block,
-      self.reveal_fee_rate,
-      reveal_outputs.clone(),
-      reveal_inputs.clone(),
-      &reveal_script,
-      rune.is_some(),
-    );
-
-    let mut target_value = reveal_fee;
-
-    if self.mode != Mode::SatPoints {
-      target_value += total_postage;
-    }
-
-    if premine > 0 {
-      target_value += TARGET_POSTAGE;
-    }
-
-    let unsigned_commit_tx = TransactionBuilder::new(
-      satpoint,
-      wallet_inscriptions,
-      utxos.clone(),
-      locked_utxos.clone(),
-      runic_utxos,
-      commit_tx_address.script_pubkey(),
-      commit_change,
-      self.commit_fee_rate,
-      Target::Value(target_value),
-      chain.network(),
-    )
-    .build_transaction()?;
-
-    let (vout, _commit_output) = unsigned_commit_tx
-      .output
-      .iter()
-      .enumerate()
-      .find(|(_vout, output)| output.script_pubkey == commit_tx_address.script_pubkey())
-      .expect("should find sat commit/inscription output");
-
-    reveal_inputs[commit_input] = OutPoint {
-      txid: unsigned_commit_tx.compute_txid(),
-      vout: vout.try_into().unwrap(),
-    };
-
-    let (mut reveal_tx, _fee) = Self::build_reveal_transaction(
-      commit_input,
-      &control_block,
-      self.reveal_fee_rate,
-      reveal_outputs.clone(),
-      reveal_inputs,
-      &reveal_script,
-      rune.is_some(),
-    );
-
-    for output in reveal_tx.output.iter() {
-      ensure!(
-        output.value >= output.script_pubkey.minimal_non_dust(),
-        "commit transaction output would be dust"
-      );
-    }
-
-    let mut prevouts = Vec::new();
-
-    for parent_info in &self.parent_info {
-      prevouts.push(parent_info.tx_out.clone());
-    }
-
-    if self.mode == Mode::SatPoints {
-      for (_satpoint, txout) in self.reveal_satpoints.iter() {
-        prevouts.push(txout.clone());
-      }
-    }
-
-    prevouts.push(unsigned_commit_tx.output[vout].clone());
-
-    let mut sighash_cache = SighashCache::new(&mut reveal_tx);
-
-    let sighash = sighash_cache
-      .taproot_script_spend_signature_hash(
+      let (mut reveal_tx, _fee) = Self::build_reveal_transaction(
         commit_input,
-        &Prevouts::All(&prevouts),
-        TapLeafHash::from_script(&reveal_script, LeafVersion::TapScript),
-        TapSighashType::Default,
-      )
-      .expect("signature hash should compute");
+        &control_block,
+        self.reveal_fee_rate,
+        reveal_outputs.clone(),
+        reveal_inputs,
+        &reveal_script,
+        rune.is_some(),
+      );
 
-    let signature = secp256k1.sign_schnorr(
-      &secp256k1::Message::from_digest_slice(sighash.as_ref())
-        .expect("should be cryptographically secure hash"),
-      &key_pair,
-    );
-
-    let witness = sighash_cache
-      .witness_mut(commit_input)
-      .expect("getting mutable witness reference should work");
-
-    witness.push(
-      Signature {
-        signature,
-        sighash_type: TapSighashType::Default,
+      if vanity.len() > 0 {
+        let str_revealtxid = reveal_tx.compute_txid().to_string();
+        if !str_revealtxid.starts_with(&vanity) {
+          continue;
+        }
       }
-      .to_vec(),
-    );
 
-    witness.push(reveal_script);
-    witness.push(control_block.serialize());
+      for output in reveal_tx.output.iter() {
+        ensure!(
+          output.value >= output.script_pubkey.minimal_non_dust(),
+          "commit transaction output would be dust"
+        );
+      }
 
-    let recovery_key_pair = key_pair.tap_tweak(&secp256k1, taproot_spend_info.merkle_root());
+      let mut prevouts = Vec::new();
 
-    let (x_only_pub_key, _parity) = recovery_key_pair.to_inner().x_only_public_key();
-    assert_eq!(
-      Address::p2tr_tweaked(
-        TweakedPublicKey::dangerous_assume_tweaked(x_only_pub_key),
-        chain.network(),
-      ),
-      commit_tx_address
-    );
+      for parent_info in &self.parent_info {
+        prevouts.push(parent_info.tx_out.clone());
+      }
 
-    let reveal_weight = reveal_tx.weight();
+      if self.mode == Mode::SatPoints {
+        for (_satpoint, txout) in self.reveal_satpoints.iter() {
+          prevouts.push(txout.clone());
+        }
+      }
 
-    if !self.no_limit && reveal_weight > bitcoin::Weight::from_wu(MAX_STANDARD_TX_WEIGHT.into()) {
-      bail!(
+      prevouts.push(unsigned_commit_tx.output[vout].clone());
+
+      let mut sighash_cache = SighashCache::new(&mut reveal_tx);
+
+      let sighash = sighash_cache
+        .taproot_script_spend_signature_hash(
+          commit_input,
+          &Prevouts::All(&prevouts),
+          TapLeafHash::from_script(&reveal_script, LeafVersion::TapScript),
+          TapSighashType::Default,
+        )
+        .expect("signature hash should compute");
+
+      let signature = secp256k1.sign_schnorr(
+        &secp256k1::Message::from_digest_slice(sighash.as_ref())
+          .expect("should be cryptographically secure hash"),
+        &key_pair,
+      );
+
+      let witness = sighash_cache
+        .witness_mut(commit_input)
+        .expect("getting mutable witness reference should work");
+
+      witness.push(
+        Signature {
+          signature,
+          sighash_type: TapSighashType::Default,
+        }
+        .to_vec(),
+      );
+
+      witness.push(reveal_script);
+      witness.push(control_block.serialize());
+
+      let recovery_key_pair = key_pair.tap_tweak(&secp256k1, taproot_spend_info.merkle_root());
+
+      let (x_only_pub_key, _parity) = recovery_key_pair.to_inner().x_only_public_key();
+      assert_eq!(
+        Address::p2tr_tweaked(
+          TweakedPublicKey::dangerous_assume_tweaked(x_only_pub_key),
+          chain.network(),
+        ),
+        commit_tx_address
+      );
+
+      let reveal_weight = reveal_tx.weight();
+
+      if !self.no_limit && reveal_weight > bitcoin::Weight::from_wu(MAX_STANDARD_TX_WEIGHT.into()) {
+        bail!(
         "reveal transaction weight greater than {MAX_STANDARD_TX_WEIGHT} (MAX_STANDARD_TX_WEIGHT): {reveal_weight}"
       );
-    }
-
-    utxos.insert(
-      reveal_tx.input[commit_input].previous_output,
-      unsigned_commit_tx.output[reveal_tx.input[commit_input].previous_output.vout as usize]
-        .clone(),
-    );
-
-    let total_fees =
-      Self::calculate_fee(&unsigned_commit_tx, &utxos) + Self::calculate_fee(&reveal_tx, &utxos);
-
-    match (Runestone::decipher(&reveal_tx), runestone) {
-      (Some(actual), Some(expected)) => assert_eq!(
-        actual,
-        Artifact::Runestone(expected),
-        "commit transaction runestone did not match expected runestone"
-      ),
-      (Some(_), None) => panic!("commit transaction contained runestone, but none was expected"),
-      (None, Some(_)) => {
-        panic!("commit transaction did not contain runestone, but one was expected")
       }
-      (None, None) => {}
+
+      utxos.insert(
+        reveal_tx.input[commit_input].previous_output,
+        unsigned_commit_tx.output[reveal_tx.input[commit_input].previous_output.vout as usize]
+          .clone(),
+      );
+
+      let total_fees =
+        Self::calculate_fee(&unsigned_commit_tx, &utxos) + Self::calculate_fee(&reveal_tx, &utxos);
+
+      match (Runestone::decipher(&reveal_tx), runestone) {
+        (Some(actual), Some(expected)) => assert_eq!(
+          actual,
+          Artifact::Runestone(expected),
+          "commit transaction runestone did not match expected runestone"
+        ),
+        (Some(_), None) => panic!("commit transaction contained runestone, but none was expected"),
+        (None, Some(_)) => {
+          panic!("commit transaction did not contain runestone, but one was expected")
+        }
+        (None, None) => {}
+      }
+
+      let rune = rune.map(|(destination, rune, vout)| RuneInfo {
+        destination: destination.map(|destination| uncheck(&destination)),
+        location: vout.map(|vout| OutPoint {
+          txid: reveal_tx.compute_txid(),
+          vout,
+        }),
+        rune,
+      });
+
+      if debug && vanity.len() > 0 {
+        println!("counter: {}", counter);
+      }
+
+      break Ok(Transactions {
+        commit_tx: unsigned_commit_tx,
+        commit_vout: vout,
+        recovery_key_pair,
+        reveal_tx,
+        rune,
+        total_fees,
+      });
     }
-
-    let rune = rune.map(|(destination, rune, vout)| RuneInfo {
-      destination: destination.map(|destination| uncheck(&destination)),
-      location: vout.map(|vout| OutPoint {
-        txid: reveal_tx.compute_txid(),
-        vout,
-      }),
-      rune,
-    });
-
-    Ok(Transactions {
-      commit_tx: unsigned_commit_tx,
-      commit_vout: vout,
-      recovery_key_pair,
-      reveal_tx,
-      rune,
-      total_fees,
-    })
   }
 
   fn backup_recovery_key(wallet: &Wallet, recovery_key_pair: TweakedKeypair) -> Result {
